@@ -7,4 +7,4 @@ from hour_bonus import (
     check_hourly_bonus_eligibility,
     get_next_claim_time,
     get_total_hourly_bonus_earned
-)
+
