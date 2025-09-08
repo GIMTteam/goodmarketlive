@@ -1,0 +1,1132 @@
+from flask import Flask, request, jsonify, render_template, session, redirect
+from blockchain import has_recent_ubi_claim
+from analytics_service import analytics
+from routes import routes
+from hour_bonus import (
+    claim_hourly_bonus,
+    check_hourly_bonus_eligibility,
+    get_next_claim_time,
+    get_total_hourly_bonus_earned
+)
+from learn_and_earn import init_learn_and_earn
+from web3 import Web3
+from datetime import datetime # Import datetime for session timestamp
+import os
+import logging
+import subprocess
+import sys
+import json
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = Flask(__name__)
+app.secret_key = os.environ.get('SECRET_KEY', 'your-secret-key-here')
+
+# Configure session for better persistence
+from datetime import timedelta
+app.permanent_session_lifetime = timedelta(hours=24)  # 24 hour session lifetime
+app.config['SESSION_COOKIE_SECURE'] = False  # Set to True in production with HTTPS
+app.config['SESSION_COOKIE_HTTPONLY'] = True
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+
+
+# Blockchain configuration for wallet balance checking
+CELO_RPC_URL = os.getenv('CELO_RPC_URL', 'https://forno.celo.org')  # Default to Celo's public RPC
+# Use the same contract address from blockchain.py
+GOODDOLLAR_CONTRACT_ADDRESS = os.getenv('GOODDOLLAR_CONTRACT', '0x62B8B11039FcfE5aB0C56E502b1C372A3d2a9c7A')
+
+# Initialize Web3 and contract connection
+w3 = None
+gooddollar_contract = None
+
+def initialize_blockchain():
+    global w3, gooddollar_contract
+    try:
+        w3 = Web3(Web3.HTTPProvider(CELO_RPC_URL))
+        if not w3.is_connected():
+            logger.error("❌ Failed to connect to Celo network")
+            return False
+
+        logger.info(f"✅ Connected to Celo network: {CELO_RPC_URL}")
+
+        if not GOODDOLLAR_CONTRACT_ADDRESS:
+            logger.error("❌ GOODDOLLAR_CONTRACT not set")
+            return False
+
+        # GoodDollar ERC20 Contract ABI for balance checking
+        contract_abi = [
+            {
+                "constant": True,
+                "inputs": [{"name": "_owner", "type": "address"}],
+                "name": "balanceOf",
+                "outputs": [{"name": "balance", "type": "uint256"}],
+                "payable": False,
+                "stateMutability": "view",
+                "type": "function"
+            },
+            {
+                "constant": True,
+                "inputs": [],
+                "name": "name",
+                "outputs": [{"name": "name", "type": "string"}],
+                "payable": False,
+                "stateMutability": "view",
+                "type": "function"
+            },
+            {
+                "constant": True,
+                "inputs": [],
+                "name": "symbol",
+                "outputs": [{"name": "symbol", "type": "string"}],
+                "payable": False,
+                "stateMutability": "view",
+                "type": "function"
+            },
+            {
+                "constant": True,
+                "inputs": [],
+                "name": "decimals",
+                "outputs": [{"name": "decimals", "type": "uint8"}],
+                "payable": False,
+                "stateMutability": "view",
+                "type": "function"
+            }
+        ]
+
+        gooddollar_contract = w3.eth.contract(
+            address=w3.to_checksum_address(GOODDOLLAR_CONTRACT_ADDRESS),
+            abi=contract_abi
+        )
+
+        logger.info(f"✅ GoodDollar contract loaded: {GOODDOLLAR_CONTRACT_ADDRESS}")
+        return True
+
+    except Exception as e:
+        logger.error(f"❌ Error initializing blockchain: {e}")
+        return False
+
+# Initialize the blockchain connection when the app starts
+if not initialize_blockchain():
+    logger.warning("Blockchain initialization failed. Wallet balance features might not work.")
+
+# Blockchain Service Class
+class BlockchainService:
+    def __init__(self, w3_instance, contract_instance):
+        self.w3 = w3_instance
+        self.gooddollar_contract = contract_instance
+
+    def get_g_balance(self, wallet_address):
+        """Get G$ balance for a wallet address"""
+        if not self.gooddollar_contract or not self.w3:
+            logger.error("❌ Blockchain service not initialized properly.")
+            return {
+                'success': False,
+                'error': 'Blockchain service not initialized',
+                'balance': 0,
+                'balance_formatted': 'Service Error'
+            }
+
+        try:
+            logger.info(f"🔍 Checking G$ balance for {wallet_address}")
+
+            # Validate wallet address
+            if not self.w3.is_address(wallet_address):
+                return {
+                    'success': False,
+                    'error': 'Invalid wallet address',
+                    'balance': 0,
+                    'balance_formatted': 'Invalid Address'
+                }
+
+            # Convert to checksum address
+            wallet_checksum = self.w3.to_checksum_address(wallet_address)
+
+            # Get balance from contract
+            balance_wei = self.gooddollar_contract.functions.balanceOf(wallet_checksum).call()
+
+            # Convert from wei to G$ (18 decimals)
+            balance_g = balance_wei / (10 ** 18)
+
+            logger.info(f"✅ Balance for {wallet_address}: {balance_g} G$")
+
+            return {
+                'success': True,
+                'balance': float(balance_g),
+                'balance_formatted': f"{balance_g:.6f} G$",
+                'wallet': wallet_address,
+                'contract': GOODDOLLAR_CONTRACT_ADDRESS
+            }
+
+        except Exception as e:
+            logger.error(f"❌ Balance check error: {e}")
+            return {
+                'success': False,
+                'error': str(e),
+                'balance': 0,
+                'balance_formatted': 'Error loading balance'
+            }
+
+    def get_contract_info(self):
+        """Get contract information"""
+        if not self.gooddollar_contract or not self.w3:
+            return {'error': 'Service not initialized'}
+
+        try:
+            name = self.gooddollar_contract.functions.name().call()
+            symbol = self.gooddollar_contract.functions.symbol().call()
+            decimals = self.gooddollar_contract.functions.decimals().call()
+
+            return {
+                'name': name,
+                'symbol': symbol,
+                'decimals': decimals,
+                'address': GOODDOLLAR_CONTRACT_ADDRESS,
+                'network': 'Celo'
+            }
+        except Exception as e:
+            return {'error': str(e)}
+
+# Create blockchain service instance
+blockchain_service = BlockchainService(w3, gooddollar_contract)
+
+# Register the routes blueprint
+app.register_blueprint(routes)
+
+# Register GoodMarket blueprint  
+# Removed: from goodmarket.routes import goodmarket_bp
+# Removed: app.register_blueprint(goodmarket_bp, url_prefix='/goodmarket')
+
+# Initialize Learn & Earn module
+init_learn_and_earn(app)
+
+# Initialize Reloadly module
+from reloadly import init_reloadly
+from reloadly.webhook import create_webhook_routes
+init_reloadly(app)
+create_webhook_routes(app)
+
+# Initialize News Feed module
+from news_feed import news_feed_service
+
+# Initialize Community Forum module
+from community_forum import community_forum_service
+
+# Initialize P2P Trading module
+from p2p_trading import init_p2p_trading
+
+# Initialize Forum Notification Service
+try:
+    from forum_notifications import forum_notification_service
+    logger.info("✅ Forum Notification Service initialized")
+except ImportError:
+    logger.error("❌ Forum Notification Service not found. Notifications will not work.")
+    # Define a placeholder or raise an error if this service is critical
+    class PlaceholderNotificationService:
+        def get_unread_notifications(self, wallet): return []
+        def get_notification_summary(self, wallet): return {'total': 0, 'types': {}}
+        def get_forum_activity_feed(self, wallet, limit): return []
+    forum_notification_service = PlaceholderNotificationService()
+
+
+@app.route("/")
+def home():
+    return render_template("login.html")
+
+@app.route("/verify-ubi", methods=["POST"])
+def verify_ubi():
+    data = request.get_json()
+    wallet = data.get("wallet")
+    if not wallet:
+        return jsonify({"status": "error", "message": "⚠️ Wallet address required"}), 400
+
+    # Validate wallet format first
+    if not (len(wallet) == 42 and wallet.startswith("0x")):
+        result = {"status": "error", "message": "❌ Invalid wallet address format"}
+        analytics.track_verification_attempt(wallet, False)
+        return jsonify(result)
+
+    # Use actual blockchain verification
+    result = has_recent_ubi_claim(wallet)
+
+    if result["status"] == "success":
+        # Store wallet in session if verified
+        session["wallet_address"] = wallet
+        session["wallet"] = wallet
+        session["verified"] = True
+        session["terms_accepted"] = False  # New field for terms tracking
+        analytics.track_verification_attempt(wallet, True)
+        analytics.track_user_session(wallet)
+
+        return jsonify({
+            "status": "success",
+            "message": result["message"],
+            "wallet": wallet,
+            "block_number": result.get("summary", {}).get("latest_activity", {}).get("block"),
+            "claim_amount": result.get("summary", {}).get("latest_activity", {}).get("amount", "N/A"),
+            "redirect_to": "/terms-and-service"  # Redirect to terms page
+        })
+    else:
+        analytics.track_verification_attempt(wallet, False)
+        return jsonify({
+            "status": "error",
+            "message": result["message"],
+            "reason": "no_recent_claim"
+        }), 400
+
+@app.route("/dashboard")
+def dashboard():
+    wallet = session.get("wallet")
+    if not wallet or not session.get("verified"):
+        return render_template("login.html")
+
+    # Check if terms are accepted
+    if not session.get("terms_accepted"):
+        return redirect("/terms-and-service")
+
+    # Track page view and get dashboard data
+    analytics.track_page_view(wallet, "dashboard")
+    dashboard_data = analytics.get_dashboard_stats(wallet)
+
+    return render_template("dashboard.html", wallet=wallet, data=dashboard_data)
+
+@app.route("/overview")
+def overview():
+    wallet = session.get("wallet")
+    if not wallet or not session.get("verified"):
+        return render_template("login.html")
+
+    # Check if terms are accepted
+    if not session.get("terms_accepted"):
+        return redirect("/terms-and-service")
+
+    # Track page view and get analytics data
+    analytics.track_page_view(wallet, "overview")
+    overview_data = analytics.get_dashboard_stats(wallet)
+
+    return render_template("overview.html", wallet=wallet, data=overview_data)
+
+@app.route("/api/analytics")
+def api_analytics():
+    wallet = session.get("wallet")
+    if not wallet or not session.get("verified"):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    return jsonify(analytics.get_user_analytics(wallet))
+
+@app.route("/api/hour-bonus/status", methods=["GET"])
+def hour_bonus_status():
+    """Get hour bonus status for current user"""
+    wallet = session.get("wallet")
+    if not wallet or not session.get("verified"):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    try:
+        # Check eligibility
+        is_eligible = check_hourly_bonus_eligibility(wallet)
+
+        # Get next claim time
+        next_claim_info = get_next_claim_time(wallet)
+
+        # Get total earned
+        total_info = get_total_hourly_bonus_earned(wallet)
+
+        return jsonify({
+            "eligible": is_eligible,
+            "can_claim_now": next_claim_info.get("can_claim_now", False),
+            "next_claim_time": next_claim_info.get("next_claim_time"),
+            "total_earned": total_info.get("total_earned", 0),
+            "total_claims": total_info.get("total_claims", 0)
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/hour-bonus/claim", methods=["POST"])
+def hour_bonus_claim():
+    """Claim hour bonus for current user"""
+    wallet = session.get("wallet")
+    if not wallet or not session.get("verified"):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    try:
+        result = claim_hourly_bonus(wallet)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/hour-bonus/history", methods=["GET"])
+def hour_bonus_history():
+    """Get hour bonus history for current user"""
+    wallet = session.get("wallet")
+    if not wallet or not session.get("verified"):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    try:
+        from hour_bonus import get_hourly_bonus_logs
+        limit = request.args.get('limit', 10, type=int)
+        history = get_hourly_bonus_logs(wallet, limit)
+        return jsonify({"success": True, "history": history})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/gooddollar-balance", methods=["GET"])
+def get_gooddollar_balance_api():
+    """Get GoodDollar balance for current user"""
+    wallet = session.get("wallet")
+    if not wallet or not session.get("verified"):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    # Use the new blockchain service
+    result = blockchain_service.get_g_balance(wallet)
+
+    if result["success"]:
+        return jsonify(result)
+    else:
+        return jsonify(result), 500
+
+@app.route("/api/contract-info", methods=["GET"])
+def get_contract_info():
+    """Get GoodDollar contract information"""
+    wallet = session.get("wallet")
+    if not wallet or not session.get("verified"):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    result = blockchain_service.get_contract_info()
+    return jsonify(result)
+
+@app.route("/terms-and-service")
+def terms_and_service():
+    """Show terms and service page after UBI verification"""
+    wallet = session.get("wallet")
+    if not wallet or not session.get("verified"):
+        return redirect("/")
+
+    # If terms already accepted, redirect to overview
+    if session.get("terms_accepted"):
+        return redirect("/overview")
+
+    return render_template("terms_and_service.html", wallet=wallet)
+
+@app.route("/accept-terms", methods=["POST"])
+def accept_terms():
+    """Handle terms acceptance"""
+    try:
+        data = request.get_json()
+        wallet = data.get("wallet")
+
+        # Verify session
+        if not wallet or wallet != session.get("wallet") or not session.get("verified"):
+            return jsonify({"success": False, "error": "Invalid session"}), 401
+
+        # Mark terms as accepted
+        session["terms_accepted"] = True
+        session.permanent = True  # Make session permanent
+
+        # Log terms acceptance
+        analytics.track_page_view(wallet, "terms_accepted")
+
+        logger.info(f"✅ Terms accepted by user: {wallet}")
+
+        return jsonify({
+            "success": True,
+            "message": "Terms accepted successfully",
+            "redirect_to": "/dashboard"
+        })
+
+    except Exception as e:
+        logger.error(f"❌ Error accepting terms: {e}")
+        return jsonify({"success": False, "error": "Failed to accept terms"}), 500
+
+@app.route("/decline-terms", methods=["POST"])
+def decline_terms():
+    """Handle terms decline - logout user"""
+    try:
+        data = request.get_json()
+        wallet = data.get("wallet")
+
+        # Log terms decline
+        if wallet:
+            analytics.track_page_view(wallet, "terms_declined")
+            logger.info(f"❌ Terms declined by user: {wallet}")
+
+        # Clear session
+        session.clear()
+
+        return jsonify({
+            "success": True,
+            "message": "Terms declined, session cleared",
+            "redirect_to": "/logout"
+        })
+
+    except Exception as e:
+        logger.error(f"❌ Error declining terms: {e}")
+        return jsonify({"success": False, "error": "Failed to process decline"}), 500
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return render_template("login.html")
+
+# API endpoints for dashboard functionality
+@app.route('/api/gooddollar-balance')
+def get_gooddollar_balance():
+    """Get GoodDollar balance for authenticated user"""
+    try:
+        wallet_address = session.get('wallet')
+        if not wallet_address or not session.get('verified'):
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        # Get balance from blockchain
+        balance_result = blockchain_service.get_g_balance(wallet_address)
+
+        # Assuming GOODDOLLAR_CONTRACTS is defined elsewhere or hardcoded if it's a single known contract
+        # For this example, let's assume GOODDOLLAR_CONTRACTS is a list of dicts with an 'address' key
+        # If GOODDOLLAR_CONTRACTS is not available, we can use the already initialized GOODDOLLAR_CONTRACT_ADDRESS
+        contract_address = GOODDOLLAR_CONTRACT_ADDRESS
+
+        return jsonify({
+            'success': True,
+            'balance': balance_result.get('balance', 0),
+            'balance_formatted': balance_result.get('balance_formatted', '0.00 G$'),
+            'contract': contract_address,
+            'wallet': wallet_address
+        })
+    except Exception as e:
+        logger.error(f"Balance API error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/hour-bonus/status')
+def get_hour_bonus_status():
+    """Get hour bonus status for authenticated user"""
+    try:
+        wallet_address = session.get('wallet')
+        if not wallet_address or not session.get('verified'):
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        # Import hour_bonus after app initialization
+        from hour_bonus import bonus_manager
+
+        # Get bonus status
+        status = bonus_manager.check_eligibility(wallet_address)
+
+        return jsonify(status)
+    except Exception as e:
+        logger.error(f"Hour bonus status API error: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'can_claim_now': False,
+            'next_claim_time': None
+        }), 500
+
+@app.route('/api/hour-bonus/claim', methods=['POST'])
+def claim_hour_bonus():
+    """Claim hour bonus for authenticated user"""
+    try:
+        wallet_address = session.get('wallet')
+        if not wallet_address or not session.get('verified'):
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        from hour_bonus import bonus_manager
+        import asyncio
+
+        # Process bonus claim
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            result = loop.run_until_complete(bonus_manager.process_bonus_claim(wallet_address))
+        finally:
+            loop.close()
+
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"Hour bonus claim API error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/hour-bonus/history')
+def get_hour_bonus_history():
+    """Get hour bonus history for authenticated user"""
+    try:
+        wallet_address = session.get('wallet')
+        if not wallet_address or not session.get('verified'):
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        from hour_bonus import bonus_manager
+
+        limit = int(request.args.get('limit', 20))
+        history = bonus_manager.get_bonus_history(wallet_address, limit)
+
+        return jsonify({
+            'success': True,
+            'history': history
+        })
+    except Exception as e:
+        logger.error(f"Hour bonus history API error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/news-feed')
+def get_news_feed_api():
+    """Get news feed for authenticated user"""
+    try:
+        wallet_address = session.get('wallet')
+        if not wallet_address or not session.get('verified'):
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        # Get query parameters
+        limit = int(request.args.get('limit', 20))
+        category = request.args.get('category')
+        featured_only = request.args.get('featured') == 'true'
+
+        # Get news feed
+        news_articles = news_feed_service.get_news_feed(
+            limit=limit,
+            category=category,
+            featured_only=featured_only
+        )
+
+        # Get news stats
+        stats = news_feed_service.get_news_stats()
+
+        return jsonify({
+            'success': True,
+            'news': news_articles,
+            'stats': stats,
+            'categories': news_feed_service.categories
+        })
+
+    except Exception as e:
+        logger.error(f"News feed API error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/news-feed/featured')
+def get_featured_news_api():
+    """Get featured news articles"""
+    try:
+        wallet_address = session.get('wallet')
+        if not wallet_address or not session.get('verified'):
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        featured_news = news_feed_service.get_featured_news(limit=3)
+
+        return jsonify({
+            'success': True,
+            'featured_news': featured_news
+        })
+
+    except Exception as e:
+        logger.error(f"Featured news API error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/forum/posts')
+def get_forum_posts_api():
+    """Get forum posts for authenticated user"""
+    try:
+        wallet_address = session.get('wallet')
+        if not wallet_address or not session.get('verified'):
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        # Get query parameters
+        limit = int(request.args.get('limit', 20))
+        category = request.args.get('category')
+        page = int(request.args.get('page', 1))
+        pinned_only = request.args.get('pinned') == 'true'
+
+        # Get forum posts
+        forum_posts = community_forum_service.get_forum_posts(
+            limit=limit,
+            category=category,
+            pinned_only=pinned_only,
+            page=page
+        )
+
+        return jsonify({
+            'success': True,
+            'posts': forum_posts,
+            'categories': community_forum_service.categories
+        })
+
+    except Exception as e:
+        logger.error(f"Forum posts API error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/forum/posts', methods=['POST'])
+def create_forum_post_api():
+    """Create new forum post"""
+    try:
+        wallet_address = session.get('wallet')
+        if not wallet_address or not session.get('verified'):
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        data = request.get_json()
+        title = data.get('title')
+        content = data.get('content')
+        category = data.get('category')
+
+        if not all([title, content, category]):
+            return jsonify({'success': False, 'error': 'Missing required fields'}), 400
+
+        # Create post
+        result = community_forum_service.create_post(
+            title=title,
+            content=content,
+            category=category,
+            author_wallet=wallet_address,
+            author_name=data.get('author_name')
+        )
+
+        return jsonify(result)
+
+    except Exception as e:
+        logger.error(f"Create forum post API error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/forum/posts/<int:post_id>/comments', methods=['POST'])
+def add_forum_comment_api(post_id):
+    """Add comment to forum post"""
+    try:
+        wallet_address = session.get('wallet')
+        if not wallet_address or not session.get('verified'):
+            logger.warning(f"Unauthenticated comment attempt for post {post_id}")
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        # Validate post_id
+        if not isinstance(post_id, int) or post_id <= 0:
+            logger.error(f"Invalid post_id: {post_id}")
+            return jsonify({'success': False, 'error': 'Invalid post ID'}), 400
+
+        # Get and validate request data with better error handling
+        try:
+            if not request.is_json:
+                logger.error("Request is not JSON")
+                return jsonify({'success': False, 'error': 'Content-Type must be application/json'}), 400
+
+            data = request.get_json(force=True)
+            if data is None:
+                logger.error("No JSON data in request")
+                return jsonify({'success': False, 'error': 'No JSON data provided'}), 400
+
+        except Exception as json_error:
+            logger.error(f"JSON parsing error: {json_error}")
+            return jsonify({'success': False, 'error': 'Invalid JSON format'}), 400
+
+        # Validate content
+        content = data.get('content')
+        if not content or not isinstance(content, str) or not content.strip():
+            logger.error(f"Invalid comment content: {content}")
+            return jsonify({'success': False, 'error': 'Valid comment content required'}), 400
+
+        content = content.strip()
+
+        # Limit content length
+        if len(content) > 2000:
+            return jsonify({'success': False, 'error': 'Comment too long (max 2000 characters)'}), 400
+
+        author_name = data.get('author_name', 'Forum User')
+        if not isinstance(author_name, str):
+            author_name = 'Forum User'
+
+        logger.info(f"💬 Adding comment to post {post_id} by {wallet_address[:8]}...")
+
+        # Add comment with the community forum service
+        result = community_forum_service.add_comment(
+            post_id=post_id,
+            content=content,
+            author_wallet=wallet_address,
+            author_name=author_name
+        )
+
+        # Log the result
+        if result.get('success'):
+            logger.info(f"✅ Comment added successfully to post {post_id}")
+        else:
+            logger.error(f"❌ Failed to add comment to post {post_id}: {result.get('error', 'Unknown error')}")
+
+        # Return JSON response
+        return jsonify(result), 200 if result.get('success') else 400
+
+    except Exception as e:
+        logger.error(f"❌ Add forum comment API error for post {post_id}: {e}")
+        return jsonify({'success': False, 'error': 'Internal server error'}), 500
+
+@app.route('/api/forum/posts/<int:post_id>/like', methods=['POST'])
+def like_forum_post_api(post_id):
+    """Like or unlike a forum post with rewards system"""
+    try:
+        wallet_address = session.get('wallet')
+        if not wallet_address or not session.get('verified'):
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        # Validate post_id
+        if not isinstance(post_id, int) or post_id <= 0:
+            return jsonify({'success': False, 'error': 'Invalid post ID'}), 400
+
+        logger.info(f"❤️ Like action for post {post_id} by {wallet_address[:8]}...")
+
+        # Like/unlike the post (now includes rewards processing)
+        result = community_forum_service.like_post(post_id, wallet_address)
+
+        if result.get('success'):
+            action = "liked" if result.get('liked') else "unliked"
+            logger.info(f"✅ Post {post_id} {action} successfully")
+
+            # Add reward notification if rewards were disbursed
+            if result.get('reward_info') and result['reward_info'].get('rewards_disbursed', 0) > 0:
+                reward_amount = result['reward_info']['rewards_disbursed']
+                result['notification'] = f"🎉 Post author rewarded {reward_amount} G$ for likes!"
+
+        else:
+            logger.error(f"❌ Failed to like post {post_id}: {result.get('error', 'Unknown error')}")
+
+        return jsonify(result), 200 if result.get('success') else 400
+
+    except Exception as e:
+        logger.error(f"❌ Like forum post API error for post {post_id}: {e}")
+        return jsonify({'success': False, 'error': 'Internal server error'}), 500
+
+
+@app.route('/api/forum/rewards/<wallet_address>', methods=['GET'])
+def get_forum_rewards_api(wallet_address):
+    """Get user's forum reward history"""
+    try:
+        session_wallet = session.get('wallet')
+        if not session_wallet or not session.get('verified'):
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        # Users can only view their own rewards
+        if session_wallet.lower() != wallet_address.lower():
+            return jsonify({'success': False, 'error': 'Unauthorized'}), 403
+
+        from forum_rewards import forum_rewards_service
+
+        # Get reward history
+        reward_history = forum_rewards_service.get_user_forum_rewards(wallet_address, limit=20)
+        total_rewards = forum_rewards_service.get_total_forum_rewards(wallet_address)
+
+        return jsonify({
+            'success': True,
+            'reward_history': reward_history,
+            'total_rewards': total_rewards
+        })
+
+    except Exception as e:
+        logger.error(f"❌ Get forum rewards API error: {e}")
+        return jsonify({'success': False, 'error': 'Internal server error'}), 500
+
+@app.route('/api/forum/notifications', methods=['GET'])
+def get_forum_notifications_api():
+    """Get user's forum reward notifications"""
+    try:
+        wallet_address = session.get('wallet')
+        if not wallet_address or not session.get('verified'):
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        from forum_notifications import forum_notification_service
+
+        # Get notifications
+        notifications = forum_notification_service.get_unread_notifications(wallet_address)
+        summary = forum_notification_service.get_notification_summary(wallet_address)
+        activity_feed = forum_notification_service.get_forum_activity_feed(wallet_address, limit=10)
+
+        return jsonify({
+            'success': True,
+            'notifications': notifications,
+            'summary': summary,
+            'activity_feed': activity_feed
+        })
+
+    except Exception as e:
+        logger.error(f"❌ Get forum notifications API error: {e}")
+        return jsonify({'success': False, 'error': 'Internal server error'}), 500
+
+
+@app.route('/api/forum/stats')
+def get_forum_stats_api():
+    """Get forum statistics"""
+    try:
+        wallet_address = session.get('wallet')
+        if not wallet_address or not session.get('verified'):
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        stats = community_forum_service.get_forum_stats()
+
+        return jsonify({
+            'success': True,
+            'stats': stats
+        })
+
+    except Exception as e:
+        logger.error(f"Forum stats API error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/verify-identity', methods=['POST'])
+def verify_identity():
+    """Handle identity verification with UBI validation"""
+    try:
+        data = request.get_json()
+        wallet_address = data.get('wallet_address', '').strip()
+        referral_code = data.get('referral_code', '').strip()
+
+        if not wallet_address:
+            return jsonify({'error': 'Wallet address is required'}), 400
+
+        # Validate wallet address format
+        if not Web3.is_address(wallet_address):
+            return jsonify({'error': 'Invalid wallet address format'}), 400
+
+        logger.info(f"🔐 Identity verification attempt for {wallet_address}")
+
+        # Check if user is already verified in the session
+        if session.get('verified') and session.get('wallet') == wallet_address:
+            logger.info(f"✅ User {wallet_address} already verified in session")
+            return jsonify({
+                'success': True,
+                'message': 'Already verified!',
+                'wallet': wallet_address,
+                'already_verified': True
+            })
+
+        # 🔥 IMPORTANT: Verify UBI claim first before processing referral
+        logger.info(f"🔍 Checking UBI verification for {wallet_address}")
+        ubi_result = has_recent_ubi_claim(wallet_address)
+
+        if ubi_result["status"] != "success":
+            logger.warning(f"❌ UBI verification failed for {wallet_address}: {ubi_result['message']}")
+            return jsonify({
+                'success': False,
+                'error': 'UBI verification required',
+                'message': ubi_result["message"]
+            }), 400
+
+        logger.info(f"✅ UBI verification successful for {wallet_address}")
+
+        # Process referral ONLY after UBI verification
+        referral_recorded = False
+        if referral_code:
+            logger.info(f"🔗 Processing referral code {referral_code} for VERIFIED user {wallet_address}")
+
+            # Import referral service
+            from referral_program import referral_service
+
+            # Validate referral first
+            import asyncio
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                validation_result = loop.run_until_complete(
+                    referral_service.validate_referral(referral_code, wallet_address)
+                )
+
+                if validation_result.get('valid'):
+                    # Record successful referral (this triggers automatic bonus)
+                    referral_recorded = loop.run_until_complete(
+                        referral_service.record_successful_referral(referral_code, wallet_address)
+                    )
+
+                    if referral_recorded:
+                        logger.info(f"✅ Referral recorded successfully: {referral_code} -> {wallet_address}")
+                        logger.info(f"💰 Automatic referral bonus should be sent to referrer!")
+                    else:
+                        logger.error(f"❌ Failed to record referral: {referral_code} -> {wallet_address}")
+                else:
+                    logger.warning(f"❌ Invalid referral code: {referral_code} - {validation_result.get('message')}")
+
+            finally:
+                loop.close()
+
+        # Track verification attempt
+        analytics.track_verification_attempt(wallet_address, True)
+
+        # Store in session
+        session['wallet'] = wallet_address
+        session['verified'] = True
+        session['verification_time'] = datetime.now().isoformat()
+        session['terms_accepted'] = False
+
+        # Store referral info in session if successful
+        if referral_recorded:
+            session['referral_code'] = referral_code
+
+        logger.info(f"✅ Identity verification successful for {wallet_address}")
+
+        response_data = {
+            'success': True,
+            'message': 'Identity verification successful!',
+            'wallet': wallet_address,
+            'ubi_verified': True,
+            'redirect_to': '/terms-and-service'
+        }
+
+        # Add referral info to response if processed
+        if referral_code:
+            response_data['referral_processed'] = referral_recorded
+            if referral_recorded:
+                response_data['referral_message'] = 'Referral bonus credited to your referrer automatically!'
+            else:
+                response_data['referral_message'] = 'Referral code could not be processed'
+
+        return jsonify(response_data)
+
+    except Exception as e:
+        logger.error(f"❌ Identity verification error: {e}")
+        return jsonify({'error': 'Verification failed'}), 500
+
+
+@app.route('/api/reloadly/history')
+def get_reloadly_history():
+    """Get Reloadly transaction history for authenticated user"""
+    try:
+        if 'wallet' not in session or not session.get('verified'):
+            return jsonify({'error': 'Not authenticated'}), 401
+
+        wallet_address = session['wallet']
+        limit = request.args.get('limit', 20, type=int)
+
+        from supabase_client import get_supabase_client
+        supabase = get_supabase_client()
+
+        if not supabase:
+            return jsonify({
+                'success': False,
+                'error': 'Database not available',
+                'history': []
+            })
+
+        # Get Reloadly orders for this user
+        result = supabase.table('reloadly_orders')\
+            .select('*')\
+            .eq('wallet_address', wallet_address)\
+            .order('created_at', desc=True)\
+            .limit(limit)\
+            .execute()
+
+        history = result.data if result.data else []
+
+        # Calculate stats
+        total_orders = len(history)
+        total_spent = sum(float(order.get('g_dollar_amount', 0) or order.get('amount', 0)) for order in history)
+        completed_orders = len([order for order in history if order.get('status') == 'completed'])
+
+        return jsonify({
+            'success': True,
+            'history': history,
+            'stats': {
+                'total_orders': total_orders,
+                'total_spent': total_spent,
+                'completed_orders': completed_orders,
+                'success_rate': f"{(completed_orders / max(total_orders, 1) * 100):.1f}%" if total_orders > 0 else "0%"
+            }
+        })
+
+    except Exception as e:
+        logger.error(f"❌ Error getting Reloadly history: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'history': []
+        }), 500
+
+@app.route('/api/debug/referral/<referral_code>')
+def debug_referral(referral_code):
+    """Debug endpoint to check referral data"""
+    try:
+        from supabase_client import get_supabase_client
+        supabase = get_supabase_client()
+
+        # Get referral code info
+        code_result = supabase.table('referral_codes')\
+            .select('*')\
+            .eq('referral_code', referral_code.upper())\
+            .execute()
+
+        # Get referral logs
+        log_result = supabase.table('referral_log')\
+            .select('*')\
+            .eq('referral_code', referral_code.upper())\
+            .execute()
+
+        # Get referral bonus logs
+        bonus_result = supabase.table('referral_bonus_log')\
+            .select('*')\
+            .eq('referrer_wallet', code_result.data[0]['referrer_wallet'] if code_result.data else '')\
+            .execute()
+
+        return jsonify({
+            'referral_code': referral_code.upper(),
+            'code_data': code_result.data,
+            'referral_logs': log_result.data,
+            'bonus_logs': bonus_result.data,
+            'total_codes': len(code_result.data),
+            'total_referrals': len(log_result.data),
+            'total_bonuses': len(bonus_result.data)
+        })
+
+    except Exception as e:
+        logger.error(f"❌ Error debugging referral {referral_code}: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route("/reloadly")
+def reloadly_page():
+    """Reloadly airtime top-up page"""
+    wallet = session.get("wallet")
+    if not wallet or not session.get("verified"):
+        return redirect("/")
+
+    # Check if terms are accepted
+    if not session.get("terms_accepted"):
+        return redirect("/terms-and-service")
+
+    # Track page view
+    analytics.track_page_view(wallet, "reloadly")
+
+    return render_template("reloadly.html", wallet=wallet)
+
+@app.route("/p2p-trading")
+def p2p_trading_page():
+    """P2P Trading page"""
+    wallet = session.get("wallet")
+    if not wallet or not session.get("verified"):
+        return redirect("/")
+
+    # Check if terms are accepted
+    if not session.get("terms_accepted"):
+        return redirect("/terms-and-service")
+
+    # Track page view
+    analytics.track_page_view(wallet, "p2p_trading")
+
+    return redirect("/p2p/")
+
+if __name__ == "__main__":
+    logger.info("🚀 Starting GoodDollar Analytics Platform...")
+
+    # Initialize Supabase logger first
+    # analytics.supabase_logger = supabase_logger # This line might be an issue if supabase_logger is not defined
+
+    # Initialize modules
+    # Initialize Hourly Bonus system
+    from hour_bonus import init_hour_bonus
+    if init_hour_bonus(app):
+        logger.info("✅ Hourly Bonus system ready")
+    else:
+        logger.error("❌ Hourly Bonus system failed to initialize")
+
+    # Initialize Referral Program system
+    from referral_program import init_referral_program
+    if init_referral_program(app):
+        logger.info("✅ Referral Program system ready")
+    else:
+        logger.error("❌ Referral Program system failed to initialize")
+
+    # Initialize P2P Trading system
+    if init_p2p_trading(app):
+        logger.info("✅ P2P Trading system ready")
+    else:
+        logger.error("❌ P2P Trading system failed to initialize")
+
+    # Only initialize Learn & Earn once
+    if not any(bp.name == 'learn_earn' for bp in app.blueprints.values()):
+        init_learn_and_earn(app)
+
+    app.run(host="0.0.0.0", port=5000, debug=True)
